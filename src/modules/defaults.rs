@@ -1,0 +1,1 @@
+pub const DEFAULT_IP: &str = "127.0.1.1:4915";
