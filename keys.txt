@@ -1,7 +1,0 @@
-abc	abc123
-def	def456
-henry	one-two
-bobby	gota
-ghi	ghi789
-will	helm
-idiot	control
