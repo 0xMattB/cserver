@@ -7,6 +7,6 @@ A simple practice console chat program written in Rust; server program, paired w
 * 0.3.0: Cleaned up and refactored code, minor improvements; works with "cserver 0.3.0"
 
 Improvement ideas:
-> Text colorization
-> Password hiding during input
-> Implementation of commands
+* Text colorization
+* Password hiding during input
+* Implementation of commands
