@@ -16,7 +16,6 @@ pub fn write(filename: &str, data: &str) -> Result<(), &'static str> {
 	}
 }
 
-/*
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -43,4 +42,3 @@ mod tests {
 		}
 	}
 }
-*/

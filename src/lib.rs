@@ -3,14 +3,17 @@ pub mod modules;
 use crate::modules::file;
 use crate::modules::console;
 use crate::modules::defaults;
+use crate::modules::command;
+use crate::modules::command::CommandType;
 use crate::modules::ip::IP;
 use crate::modules::list::List;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
-use tokio::net::TcpStream;
+use tokio::sync::broadcast::{Sender, Receiver};
 use std::error::Error;
 use std::process;
+use std::sync::{Arc, Mutex};
 
 enum ServerState {
 	UserPrompt,
@@ -19,6 +22,8 @@ enum ServerState {
 	PasswordPrompt,
 	PasswordReceive,
 	PasswordCheck,
+	MessageLogIn,
+	MessageInvalidPassword,
 	NewUserPrompt,
 	NewUserReceive,
 	NewPassword1Prompt,
@@ -27,12 +32,13 @@ enum ServerState {
 	NewPassword2Receive,
 	NewPasswordCheck,
 	NewUserAdd,
+	NewUserMessage,
 	Connected,
 	Disconnect,
 }
 
 pub async fn run(filename: &str) -> Result<(), Box<dyn Error>> {
-	let mut user_list: List;
+	let ulist: List;
 	let ip: String;
 
 	// load ip address
@@ -51,221 +57,206 @@ pub async fn run(filename: &str) -> Result<(), Box<dyn Error>> {
 	
 	// store file data into memory
 	if let Some(dlist) = create_data_list(&file_data) {
-		user_list = dlist;
+		ulist = dlist;
 	} else {
 		console::output("error loading data contents", true);
 		process::exit(0);
 	}
 	
-    let listener = TcpListener::bind(&ip).await?;
-    println!("Listening on: {}", ip);
+	// create entites shared across client tasks
+	let user_list = Arc::new(Mutex::new(ulist));
+	let fname = Arc::new(Mutex::new(String::from(filename)));
+	let (tx_broadcast, _): (Sender<_>, Receiver<_>) = tokio::sync::broadcast::channel(16);
 	
-    loop {
-        // Asynchronously wait for an inbound socket.
-        let (mut socket, _) = listener.accept().await?;
-		let mut state = ServerState::UserPrompt;	
-		let mut user = String::default();
-		let mut password = String::default();
-		let mut password1 = String::default();
-		let mut password2 = String::default();
-		let fname = String::from(filename);
-
-        // And this is where much of the magic of this server happens. We
-        // crucially want all clients to make progress concurrently, rather than
-        // blocking one on completion of another. To achieve this we use the
-        // `tokio::spawn` function to execute the work in the background.
-        //
-        // Essentially here we're executing a new task to run concurrently,
-        // which will allow all of our clients to be processed concurrently.
-
-        user_list = tokio::spawn(async move {
-            //let mut user = String::default();
-            //let mut password = String::default();
-            //let mut password1 = String::default();
-            //let mut password2 = String::default();
-			
-			loop {
-                //let mut buf = vec![0; 1024];
+    // listen for connections on specified port
+	let listener = TcpListener::bind(&ip).await?;
+    console::output(&format!["Listening on: {}", ip], true);
+	
+	// connection check loop
+	loop {
+		match listener.accept().await {
+			Ok((mut socket, addr)) => {
+				console::output(&format!["Connection from: {}", addr], true);
+				let user_list = user_list.clone();
+				let fname = fname.clone();
+				let tx_broadcast = tx_broadcast.clone();
+				let mut rx_broadcast = tx_broadcast.subscribe();
 				
-				match state {
-					ServerState::UserPrompt => {
-						transmit(&mut socket, "Username: ").await;
-						state = ServerState::UserReceive;
-					},
+				tokio::spawn(async move {
+					let mut state = ServerState::UserPrompt;	
+					let mut user = String::default();
+					let mut password = String::default();
+					let mut password1 = String::default();
+					let mut password2 = String::default();
+					let (mut reader, mut writer) = socket.split();
 					
-					ServerState::UserReceive => {
-						match receive(&mut socket).await {
-							Ok(s) => {
-								let s = clean_string(&String::from(s));
-								println!("Received: '{}'", s);
-								user = String::from(s);
-								user = trim_null(&user);
-								state = ServerState::UserCheck;
+					loop {
+						match state {
+							ServerState::UserPrompt => {
+								transmit(&mut writer, "Username: ").await;
+								state = ServerState::UserReceive;
 							},
-							Err(e) => {
-								println!("{}", e);
-								break;
+							
+							ServerState::UserReceive => {
+								if let Some(s) = receive(&mut reader).await {
+									user = String::from(s);
+									state = ServerState::UserCheck;
+								}
 							},
-						}
-					},
-					
-					ServerState::UserCheck => {
-						if user_list.check_key(&user) {
-							state = ServerState::PasswordPrompt;
-						} else {
-							state = ServerState::NewUserPrompt;
-						}
-					},
-					
-					ServerState::PasswordPrompt => {
-						transmit(&mut socket, "Password: ").await;
-						state = ServerState::PasswordReceive;
-					},
-					
-					ServerState::PasswordReceive => {
-						match receive(&mut socket).await {
-							Ok(s) => {
-								let s = clean_string(&String::from(s));
-								println!("Received: '{}'", s);
-								password = String::from(s);
-								password = trim_null(&password);
-								state = ServerState::PasswordCheck;
-							},
-							Err(e) => {
-								println!("{}", e);
-								break;
-							},
-						}
-					},
-					
-					ServerState::PasswordCheck => {
-						if user_list.check(&user, &password) {
-							transmit(&mut socket, "Logged in").await;
-							state = ServerState::Connected;
-						} else {
-							transmit(&mut socket, "Invalid password").await;
-							state = ServerState::Disconnect;
-						}
-					},
-					
-					ServerState::NewUserPrompt => {
-						transmit(&mut socket, "User not found - create new account? (y/n): ").await;
-						state = ServerState::NewUserReceive;
-					},
-					
-					ServerState::NewUserReceive => {
-						match receive(&mut socket).await {
-							Ok(s) => {
-								let mut s = clean_string(&String::from(s));
-								s = trim_null(&s);
-								println!("Received: '{}'", s);
+							
+							ServerState::UserCheck => {
+								let user_list = user_list.lock().unwrap();
 								
-								if s == "y" || s == "Y" {
-									state = ServerState::NewPassword1Prompt;
+								if user_list.check_key(&user) {
+									state = ServerState::PasswordPrompt;
 								} else {
-									transmit(&mut socket, "Invalid username").await;
+									state = ServerState::NewUserPrompt;
+								}
+							},
+							
+							ServerState::PasswordPrompt => {
+								transmit(&mut writer, "Password: ").await;
+								state = ServerState::PasswordReceive;
+							},
+							
+							ServerState::PasswordReceive => {
+								if let Some(s) = receive(&mut reader).await {
+									password = String::from(s);
+									state = ServerState::PasswordCheck;
+								}
+							},
+							
+							ServerState::PasswordCheck => {
+								let user_list = user_list.lock().unwrap();
+								
+								if user_list.check(&user, &password) {
+									state = ServerState::MessageLogIn;
+								} else {
+									state = ServerState::MessageInvalidPassword;
+								}
+							},
+							
+							ServerState::MessageLogIn => {
+								transmit(&mut writer, "Logged in").await;
+								state = ServerState::Connected;
+							}
+							
+							ServerState::MessageInvalidPassword => {
+								transmit(&mut writer, "Invalid password").await;
+								state = ServerState::Disconnect;
+							}
+							
+							ServerState::NewUserPrompt => {
+								transmit(&mut writer, "User not found - create new account? (y/n): ").await;
+								state = ServerState::NewUserReceive;
+							},
+							
+							ServerState::NewUserReceive => {
+								if let Some(s) = receive(&mut reader).await {
+									if s == "y" || s == "Y" {
+										state = ServerState::NewPassword1Prompt;
+									} else {
+										transmit(&mut writer, "Invalid username").await;
+										state = ServerState::Disconnect;
+									}
+								}
+							},
+							
+							ServerState::NewPassword1Prompt => {
+								transmit(&mut writer, "Enter new password: ").await;
+								state = ServerState::NewPassword1Receive;
+								
+							},
+							
+							ServerState::NewPassword1Receive => {
+								if let Some(s) = receive(&mut reader).await {
+									password1 = String::from(s);
+									state = ServerState::NewPassword2Prompt;
+								}
+							},
+							
+							ServerState::NewPassword2Prompt => {
+								transmit(&mut writer, "Re-enter password : ").await;
+								state = ServerState::NewPassword2Receive;
+							},
+							
+							ServerState::NewPassword2Receive => {
+								if let Some(s) = receive(&mut reader).await {
+									password2 = String::from(s);
+									state = ServerState::NewPasswordCheck;
+								}
+							},
+							
+							ServerState::NewPasswordCheck => {
+								if password1 == password2 {
+									state = ServerState::NewUserAdd;
+								} else {
+									transmit(&mut writer, "Invalid (passwords don't match)").await;
 									state = ServerState::Disconnect;
 								}
 							},
-							Err(e) => {
-								println!("{}", e);
-								break;
-							},
-						}
-					},
-					
-					ServerState::NewPassword1Prompt => {
-						transmit(&mut socket, "Enter new password: ").await;
-						state = ServerState::NewPassword1Receive;
-						
-					},
-					
-					ServerState::NewPassword1Receive => {
-						match receive(&mut socket).await {
-							Ok(s) => {
-								let s = clean_string(&String::from(s));
-								println!("Received: '{}'", s);
-								password1 = String::from(s);
-								password1 = trim_null(&password1);
-								state = ServerState::NewPassword2Prompt;
-							},
-							Err(e) => {
-								println!("{}", e);
-								break;
-							},
-						}
-					},
-					
-					ServerState::NewPassword2Prompt => {
-						transmit(&mut socket, "Re-enter password : ").await;
-						state = ServerState::NewPassword2Receive;
-					},
-					
-					ServerState::NewPassword2Receive => {
-						match receive(&mut socket).await {
-							Ok(s) => {
-								let s = clean_string(&String::from(s));
-								println!("Received: '{}'", s);
-								password2 = String::from(s);
-								password2 = trim_null(&password2);
-								state = ServerState::NewPasswordCheck;
-							},
-							Err(e) => {
-								println!("{}", e);
-								break;
-							},
-						}
-					},
-					
-					ServerState::NewPasswordCheck => {
-						if password1 == password2 {
-							state = ServerState::NewUserAdd;
-						} else {
-							transmit(&mut socket, "Invalid (passwords don't match)").await;
-							state = ServerState::Disconnect;
-						}
-					},
-					
-					ServerState::NewUserAdd => {
-						user_list.add(&user, &password1);
-						let _ = file::write(&fname, &get_user_list_as_string(&user_list));
-						transmit(&mut socket, "Logged in").await;
-						state = ServerState::Connected;
-					},
-					
-					ServerState::Connected => {
-						match receive(&mut socket).await {
-							Ok(s) => {
-								let mut s = clean_string(&String::from(s));
-								s = trim_null(&s);
-								println!("Received: '{}'", s);
+							
+							ServerState::NewUserAdd => {
+								let mut user_list = user_list.lock().unwrap();
+								let fname = fname.lock().unwrap();
 								
-								if s == "!shutdown" {
-									state = ServerState::Disconnect;
-								} else {
-									let response = format!["{}: {}", user, s];
-									transmit(&mut socket, &response).await;
+								user_list.add(&user, &password1);
+								let _ = file::write(&fname, &get_user_list_as_string(&user_list));
+								state = ServerState::NewUserMessage;
+								
+							},
+							
+							ServerState::NewUserMessage => {
+								transmit(&mut writer, "Logged in").await;
+								state = ServerState::Connected;
+							}
+							
+							ServerState::Connected => {
+
+								tokio::select! {
+									// data available from a client, which is then broadcast to all clients
+									result = receive(&mut reader) => {
+										match result {
+											Some(data) => {
+												match command::command(&data) {
+													CommandType::None => {
+														let updated = format!["{}: {}", user, data];
+														tx_broadcast.send(updated.into_bytes()).unwrap();
+													},
+													CommandType::Party => {
+														let updated = format!["*** {} is having a party! ***", user];
+														tx_broadcast.send(updated.into_bytes()).unwrap();
+													},
+													CommandType::Exit => {
+														let updated = format!["!exit"];
+														tx_broadcast.send(updated.into_bytes()).unwrap();
+														process::exit(0);
+													},
+												}
+											},
+											None => {},
+										}
+									}
+									
+									// broadcast available, to be sent to all logged clients
+									result = rx_broadcast.recv() => {
+										let msg = result.unwrap();
+										let msg = std::str::from_utf8(&msg).unwrap();
+										transmit(&mut writer, &msg).await;
+									}
 								}
 							},
-							Err(e) => {
-								println!("{}", e);
+							
+							ServerState::Disconnect => {
 								break;
 							},
 						}
-						
-						// TODO: change state
-					},
-					
-					ServerState::Disconnect => {
-						//process::exit(0);
-						break;
-					},
-				}
-            }
-			
-			return user_list;
-        }).await.unwrap();
-    }
+					}
+				});
+			},
+			Err(_) => {},  // connection error
+		};
+	}
 }
 
 fn load_data(filename: &str) -> String {
@@ -299,25 +290,27 @@ fn create_data_list(data: &str) -> Option<List> {
 	Some(list)
 }
 
-async fn transmit(socket: &mut TcpStream, s: &str) {
-	socket.write_all(s.as_bytes()).await.expect("failed to write data to socket");
+async fn transmit(writer: &mut WriteHalf<'_>, s: &str) {
+	writer.try_write(s.as_bytes()).expect("failed to write data to socket");
 }
 
-async fn receive(socket: &mut TcpStream) -> Result<String, String> {
+async fn receive(reader: &mut ReadHalf<'_>) -> Option<String> {
 	let mut buf = vec![0; 1024];
-	let n = socket.read(&mut buf).await;
 
-	match n {
+	match reader.try_read(&mut buf) {
 		Ok(_) => {
 			let s = match std::str::from_utf8(&buf) {
 				Ok(v) => { v },
-				Err(e) => { return Err(format!("Invalid UTF-8 sequence: {}", e)); },
+				Err(_) => { return None; },
 			};
 			
-			return Ok(String::from(s));
+			let s = clean_string(&String::from(s));
+			let s = trim_null(&s);
+
+			return Some(s);
 		},
-		Err(e) => {
-			return Err(format!["error: {}", e]);
+		Err(_) => {
+			return None;
 		},
 	};
 }

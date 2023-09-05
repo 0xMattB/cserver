@@ -48,7 +48,7 @@ mod tests {
 	}
 	
 	#[test]
-	fn command_exit() {
+	fn command_party() {
 		assert_eq!(
 			command("!party"),
 			CommandType::Party,

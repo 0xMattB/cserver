@@ -20,13 +20,15 @@ impl List {
 		}
 	}
 
-//	pub fn remove(&mut self, user: &str) -> bool {
-//		if let Some(_) = self.list.remove(user) {
-//			true
-//		} else {
-//			false
-//		}
-//	}
+/*
+	pub fn remove(&mut self, user: &str) -> bool {
+		if let Some(_) = self.list.remove(user) {
+			true
+		} else {
+			false
+		}
+	}
+*/
 
 	pub fn check(&self, user: &str, pass: &str) -> bool {
 		if let Some(v) = Self::get_value(self, user) {
